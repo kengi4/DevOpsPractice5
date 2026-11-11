@@ -1,0 +1,48 @@
+name: CI
+
+# Запускати пайплайн при кожному push до гілки main
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Завантаження коду репозиторію
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Встановлення Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 3. Встановлення залежностей
+      - name: Install dependencies
+        run: npm install
+
+      # 4. Запуск білду
+      - name: Build project
+        run: npm run build
+
+      # 5. Перевірка, що білд завершився успішно і результат існує
+      - name: Verify build output
+        run: |
+          if [ ! -f dist/index.html ]; then
+            echo "Build failed: dist/index.html not found"
+            exit 1
+          fi
+          echo "Build succeeded. Contents of dist/:"
+          ls -la dist
+          cat dist/index.html
+
+      # 6. Збереження результату білду як артефакту
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: dist/
