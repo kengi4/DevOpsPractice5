@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 # Запускати пайплайн при кожному push до гілки main
 on:
@@ -7,7 +7,7 @@ on:
       - main
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,9 +25,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # 4. Запуск білду
-      - name: Build project
-        run: npm run build
+      # 4. Перевірка синтаксису та запуск білду
+      - name: Check syntax and build project
+        run: |
+          node --check index.js
+          npm run build
 
       # 5. Перевірка, що білд завершився успішно і результат існує
       - name: Verify build output
@@ -47,7 +49,56 @@ jobs:
           name: build
           path: dist/
 
-      # 7. Декодування SSH-ключа для підключення до EC2
+      # 7. Перевірка наявності секретів Docker Hub
+      - name: Validate Docker Hub secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "Error: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets must be set"
+            exit 1
+          fi
+
+      # 8. Налаштування Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 9. Авторизація в Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 10. Генерація тегів із гілки та короткого хешу коміту
+      - name: Get short commit hash
+        id: vars
+        run: echo "sha_tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nodeapp
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,format=short
+            type=raw,value=${{ steps.vars.outputs.sha_tag }}
+
+      # 11. Збірка та публікація Docker-образу в Docker Hub
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 12. Декодування SSH-ключа для підключення до сервера
       - name: Decode SSH key
         env:
           EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
@@ -59,35 +110,105 @@ jobs:
           printf '%s' "$EC2_SSH_KEY_B64" | tr -d '[:space:]' | base64 -d > ec2-key.pem
           chmod 600 ec2-key.pem
 
-      # 8. Копіювання файлів проєкту на сервер EC2
-      - name: Copy project files to EC2
+      # 13. Копіювання файлів проєкту на віддалений сервер
+      - name: Copy project files to server
         run: |
           rsync -avz --delete \
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='ec2-key.pem' \
+            --exclude='.env' \
             --rsync-path="mkdir -p /home/${{ secrets.EC2_USER }}/nodeapp && rsync" \
             -e "ssh -i ec2-key.pem -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USER }}/nodeapp
 
-      # 9. Встановлення залежностей та запуск застосунку на EC2
-      - name: Deploy and start application on EC2
+      # 14. Встановлення Docker і Docker Compose на сервері
+      - name: Prepare server (remove pm2 and install Docker)
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
         run: |
-          ssh -i ec2-key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          ssh -i ec2-key.pem -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" << 'EOF'
             set -e
-            if ! command -v node >/dev/null 2>&1; then
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              sudo apt-get install -y nodejs
+
+            if command -v pm2 >/dev/null 2>&1; then
+              pm2 stop all || true
+              pm2 delete all || true
+              pm2 kill || true
+              sudo npm uninstall -g pm2 || true
             fi
-            if ! command -v pm2 >/dev/null 2>&1; then
-              sudo npm install -g pm2
+            rm -rf "$HOME/.pm2" "$HOME/nodeapp/node_modules"
+
+            if ! command -v docker >/dev/null 2>&1 || ! sudo docker compose version >/dev/null 2>&1; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+              echo \
+                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER"
             fi
-            cd "$HOME/nodeapp"
-            npm install
-            if pm2 describe index >/dev/null 2>&1; then
-              pm2 restart index
-            else
-              pm2 start index.js --name index
-            fi
-            pm2 status
           EOF
+
+      # 15. Авторизація Docker на сервері та деплой через docker compose
+      - name: Deploy with Docker Compose on server
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.vars.outputs.sha_tag }}
+        run: |
+          DOCKERHUB_USER_LOWER=$(printf '%s' "$DOCKERHUB_USERNAME" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+
+          printf '%s' "$DOCKERHUB_TOKEN" | ssh -i ec2-key.pem -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" \
+            "if docker info >/dev/null 2>&1; then docker login -u '$DOCKERHUB_USER_LOWER' --password-stdin; else sudo docker login -u '$DOCKERHUB_USER_LOWER' --password-stdin; fi"
+
+          ssh -i ec2-key.pem -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" \
+            "DOCKERHUB_USER_LOWER='${DOCKERHUB_USER_LOWER}' IMAGE_TAG='${IMAGE_TAG}' bash -s" << 'EOF'
+            set -e
+            if docker info >/dev/null 2>&1; then
+              DOCKER="docker"
+            else
+              DOCKER="sudo docker"
+            fi
+
+            cd "$HOME/nodeapp"
+
+            printf 'DOCKERHUB_USERNAME=%s\nIMAGE_TAG=%s\n' "$DOCKERHUB_USER_LOWER" "$IMAGE_TAG" > .env
+
+            $DOCKER compose down || true
+            $DOCKER rm -f nodeapp || true
+
+            $DOCKER compose pull
+            $DOCKER compose up -d --no-build
+
+            for i in $(seq 1 20); do
+              if curl -fsS http://localhost:3000/health; then
+                echo ""
+                break
+              fi
+              if [ "$i" -eq 20 ]; then
+                echo "Application health check failed"
+                $DOCKER compose ps
+                $DOCKER compose logs --tail=50
+                exit 1
+              fi
+              sleep 3
+            done
+
+            $DOCKER compose ps
+            $DOCKER compose logs --tail=30
+            $DOCKER image prune -f || true
+          EOF
+
+      # 16. Очищення тимчасового SSH-ключа на ранері
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ec2-key.pem
